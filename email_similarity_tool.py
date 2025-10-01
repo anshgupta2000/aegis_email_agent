@@ -409,7 +409,7 @@ class EmailSimilarityTool:
         
         return dot_product / (norm1 * norm2)
     
-    def find_similar_emails(self, email_file: str, top_k: int = 10, min_similarity: float = 0.0) -> Dict:
+    def find_similar_emails(self, email_file: str, top_k: int = 10, min_similarity: float = 0.75) -> Dict:
         """
         Find similar emails to the given email file using ChromaDB - TOOL CALL INTERFACE
         
