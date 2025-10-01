@@ -5,7 +5,6 @@ This module provides the email similarity search functionality as a tool call
 
 import os
 import json
-import pickle
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from email import message_from_file
@@ -18,6 +17,7 @@ from functools import lru_cache
 import re
 import html
 from bs4 import BeautifulSoup
+import chromadb
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -45,13 +45,17 @@ class EmailSimilarityTool:
         """
         self.api_key = api_key
         self.email_dir = Path(email_dir)
-        self.embeddings_cache_file = self.email_dir / "embeddings_cache.pkl"
+        self.chroma_db_path = self.email_dir / "chroma_db"
         self.emails_data: Dict[str, EmailData] = {}
         
         # Initialize OpenAI client
         self.client = openai.OpenAI(api_key=api_key)
         
-        # Load or create embeddings cache
+        # Initialize ChromaDB client
+        self.chroma_client = chromadb.PersistentClient(path=str(self.chroma_db_path))
+        self.collection_name = "email_embeddings"
+        
+        # Load or create embeddings in ChromaDB
         self._load_or_create_embeddings()
     
     def _extract_email_content(self, eml_file_path: Path) -> EmailData:
@@ -221,27 +225,37 @@ class EmailSimilarityTool:
             return []
     
     def _load_or_create_embeddings(self):
-        """Load existing embeddings cache or create new one"""
-        if self.embeddings_cache_file.exists():
-            logger.info("Loading existing embeddings cache...")
-            try:
-                with open(self.embeddings_cache_file, 'rb') as f:
-                    self.emails_data = pickle.load(f)
-                logger.info(f"Loaded {len(self.emails_data)} emails from cache")
-            except Exception as e:
-                logger.error(f"Error loading cache: {e}")
-                self._create_embeddings()
-        else:
-            logger.info("No cache found, creating new embeddings...")
+        """Load existing embeddings from ChromaDB or create new ones"""
+        try:
+            # Try to get existing collection
+            self.collection = self.chroma_client.get_collection(name=self.collection_name)
+            logger.info(f"Loaded existing ChromaDB collection with {self.collection.count()} emails")
+            
+            # Load email metadata for compatibility
+            self._load_email_metadata()
+            
+            # Check for new emails and add them
+            self._add_new_emails_to_collection()
+        except Exception:
+            logger.info("No existing collection found, creating new embeddings...")
             self._create_embeddings()
     
     def _create_embeddings(self):
-        """Create embeddings for all emails in the directory"""
+        """Create embeddings for all emails in the directory and store in ChromaDB"""
         eml_files = list(self.email_dir.glob("*.eml"))
         logger.info(f"Found {len(eml_files)} .eml files")
         
+        # Create new collection
+        self.collection = self.chroma_client.create_collection(name=self.collection_name)
+        
+        # Prepare data for batch insertion
+        ids = []
+        embeddings = []
+        metadatas = []
+        documents = []
+        
         for i, eml_file in enumerate(eml_files):
-            logger.info(f"Processing {i+1}/{len(eml_files)}: {eml_file.name}")
+            print(f"Processing {i+1}/{len(eml_files)}: {eml_file.name}")
             
             # Extract email content
             email_data = self._extract_email_content(eml_file)
@@ -251,32 +265,141 @@ class EmailSimilarityTool:
                 # Combine subject and content for better semantic understanding
                 combined_text = f"{email_data.subject} {email_data.content}"
                 email_data.embedding = self._get_openai_embedding(combined_text)
+                
+                # Only add to ChromaDB if embedding was successfully created
+                if email_data.embedding and len(email_data.embedding) > 0:
+                    ids.append(eml_file.name)
+                    embeddings.append(email_data.embedding)
+                    metadatas.append({
+                        "filename": email_data.filename,
+                        "subject": email_data.subject,
+                        "sender": email_data.sender,
+                        "content_length": len(email_data.content)
+                    })
+                    documents.append(combined_text)
+                else:
+                    logger.warning(f"Skipping {eml_file.name} - failed to generate embedding")
             
             self.emails_data[eml_file.name] = email_data
         
-        # Save cache
-        self._save_embeddings_cache()
-        logger.info("Embeddings created and cached successfully")
+        # Batch insert into ChromaDB
+        if ids:
+            self.collection.add(
+                ids=ids,
+                embeddings=embeddings,
+                metadatas=metadatas,
+                documents=documents
+            )
+            logger.info(f"Successfully stored {len(ids)} email embeddings in ChromaDB")
+        else:
+            logger.warning("No emails with content found to store")
+        
+        logger.info("Embeddings created and stored in ChromaDB successfully")
     
-    def _save_embeddings_cache(self):
-        """Save embeddings to cache file"""
+    def _load_email_metadata(self):
+        """Load email metadata from ChromaDB for compatibility with existing interface"""
         try:
-            with open(self.embeddings_cache_file, 'wb') as f:
-                pickle.dump(self.emails_data, f)
-            logger.info("Embeddings cache saved")
+            # Get all documents from ChromaDB to populate emails_data
+            results = self.collection.get()
+            
+            if results and 'ids' in results and results['ids']:
+                for i, filename in enumerate(results['ids']):
+                    metadata = results['metadatas'][i] if 'metadatas' in results and results['metadatas'] else {}
+                    embedding = results['embeddings'][i] if 'embeddings' in results and results['embeddings'] else None
+                    document = results['documents'][i] if 'documents' in results and results['documents'] else ""
+                    
+                    # Reconstruct EmailData object
+                    email_data = EmailData(
+                        filename=metadata.get('filename', filename),
+                        subject=metadata.get('subject', ''),
+                        sender=metadata.get('sender', ''),
+                        content=document,  # This is the combined text
+                        embedding=embedding
+                    )
+                    
+                    self.emails_data[filename] = email_data
+                
+                logger.info(f"Loaded metadata for {len(self.emails_data)} emails from ChromaDB")
+            else:
+                logger.warning("No data found in ChromaDB collection")
+                self.emails_data = {}
         except Exception as e:
-            logger.error(f"Error saving cache: {e}")
+            logger.error(f"Error loading email metadata from ChromaDB: {e}")
+            self.emails_data = {}
+    
+    def _add_new_emails_to_collection(self):
+        """Check for new emails in the directory and add them to ChromaDB"""
+        try:
+            # Get all email files in the directory
+            all_eml_files = set(eml_file.name for eml_file in self.email_dir.glob("*.eml"))
+            # Get existing emails in ChromaDB
+            existing_emails = set(self.emails_data.keys())
+            
+            # Find new emails
+            new_emails = all_eml_files - existing_emails
+            
+            if new_emails:
+                logger.info(f"Found {len(new_emails)} new emails to add to ChromaDB")
+                
+                # Prepare data for batch insertion
+                ids = []
+                embeddings = []
+                metadatas = []
+                documents = []
+                
+                for i, filename in enumerate(sorted(new_emails)):
+                    eml_file = self.email_dir / filename
+                    print(f"Processing {i+1}/{len(new_emails)}: {filename}")
+                    
+                    # Extract email content
+                    email_data = self._extract_email_content(eml_file)
+                    
+                    # Create embedding for the content
+                    if email_data.content:
+                        combined_text = f"{email_data.subject} {email_data.content}"
+                        email_data.embedding = self._get_openai_embedding(combined_text)
+                        
+                        # Only add to ChromaDB if embedding was successfully created
+                        if email_data.embedding and len(email_data.embedding) > 0:
+                            ids.append(filename)
+                            embeddings.append(email_data.embedding)
+                            metadatas.append({
+                                "filename": email_data.filename,
+                                "subject": email_data.subject,
+                                "sender": email_data.sender,
+                                "content_length": len(email_data.content)
+                            })
+                            documents.append(combined_text)
+                        else:
+                            logger.warning(f"Skipping {filename} - failed to generate embedding")
+                    
+                    self.emails_data[filename] = email_data
+                
+                # Batch insert into ChromaDB
+                if ids:
+                    self.collection.add(
+                        ids=ids,
+                        embeddings=embeddings,
+                        metadatas=metadatas,
+                        documents=documents
+                    )
+                    logger.info(f"Successfully added {len(ids)} new email embeddings to ChromaDB")
+                    logger.info(f"ChromaDB collection now contains {self.collection.count()} emails")
+            else:
+                logger.info("No new emails to add - collection is up to date")
+        except Exception as e:
+            logger.error(f"Error adding new emails to ChromaDB: {e}")
     
     def cosine_similarity(self, embedding1: List[float], embedding2: List[float]) -> float:
-        """Calculate cosine similarity between two embeddings"""
+        """Calculate cosine similarity between two embeddings (kept for compatibility)"""
         if not embedding1 or not embedding2:
             return 0.0
-        print("THIS IS THE TOOL")
+        
         # Convert to numpy arrays
         vec1 = np.array(embedding1)
         vec2 = np.array(embedding2)
         
-        # Calculate cosine similarity
+        # Calculate cosine similarityt
         dot_product = np.dot(vec1, vec2)
         norm1 = np.linalg.norm(vec1)
         norm2 = np.linalg.norm(vec2)
@@ -288,7 +411,7 @@ class EmailSimilarityTool:
     
     def find_similar_emails(self, email_file: str, top_k: int = 10, min_similarity: float = 0.0) -> Dict:
         """
-        Find similar emails to the given email file - TOOL CALL INTERFACE
+        Find similar emails to the given email file using ChromaDB - TOOL CALL INTERFACE
         
         Args:
             email_file: Path to the input email file
@@ -299,7 +422,7 @@ class EmailSimilarityTool:
             Dictionary with results for agent consumption
         """
         email_path = Path(email_file)
-        print("THIS IS THE TOOL")
+        
         # Extract content from input email
         input_email = self._extract_email_content(email_path)
         
@@ -333,47 +456,79 @@ class EmailSimilarityTool:
                 "similar_emails": []
             }
         
-        # Calculate similarities
-        similarities = []
-        for filename, email_data in self.emails_data.items():
-            if filename == email_path.name:
-                continue  # Skip the input email itself
+        try:
+            # Query ChromaDB for similar emails
+            print(f"🔍 Querying ChromaDB for {top_k} similar emails...")
+            results = self.collection.query(
+                query_embeddings=[input_embedding],
+                n_results=top_k + 1,  # +1 to account for potential self-match
+                where={"filename": {"$ne": email_path.name}}  # Exclude the input email itself
+            )
+            print(f"✓ ChromaDB returned {len(results['ids'][0]) if results['ids'] else 0} results")
             
-            if email_data.embedding:
-                similarity = self.cosine_similarity(input_embedding, email_data.embedding)
-                if similarity >= min_similarity:
-                    similarities.append((filename, similarity, email_data))
-        
-        # Sort by similarity (descending) and return top_k
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        top_similarities = similarities[:top_k]
-        
-        # Format results for agent consumption
-        similar_emails = []
-        for filename, score, email_data in top_similarities:
-            similar_emails.append({
-                "filename": filename,
-                "similarity_score": round(score, 4),
-                "subject": email_data.subject,
-                "sender": email_data.sender,
-                "content_length": len(email_data.content),
-                "content_preview": email_data.content[:200] + "..." if len(email_data.content) > 200 else email_data.content
-            })
-        
-        return {
-            "success": True,
-            "input_email": {
-                "filename": input_email.filename,
-                "subject": input_email.subject,
-                "sender": input_email.sender,
-                "content_length": len(input_email.content),
-                "content_preview": input_email.content[:200] + "..." if len(input_email.content) > 200 else input_email.content
-            },
-            "similar_emails": similar_emails,
-            "total_found": len(similarities),
-            "returned": len(top_similarities),
-            "min_similarity_threshold": min_similarity
-        }
+            # Process results
+            similar_emails = []
+            total_found = 0
+            
+            if results['ids'] and len(results['ids']) > 0:
+                ids = results['ids'][0]
+                distances = results['distances'][0]
+                metadatas = results['metadatas'][0]
+                documents = results['documents'][0]
+                
+                # Convert distances to similarity scores (ChromaDB uses cosine distance)
+                # Cosine distance = 1 - cosine similarity, so similarity = 1 - distance
+                similarities = [1 - distance for distance in distances]
+                
+                # Filter by minimum similarity threshold
+                filtered_results = []
+                for i, similarity in enumerate(similarities):
+                    if similarity >= min_similarity:
+                        filtered_results.append((ids[i], similarity, metadatas[i], documents[i]))
+                        total_found += 1
+                
+                # Sort by similarity (descending)
+                filtered_results.sort(key=lambda x: x[1], reverse=True)
+                
+                # Format results for agent consumption
+                for filename, score, metadata, document in filtered_results[:top_k]:
+                    similar_emails.append({
+                        "filename": filename,
+                        "similarity_score": round(score, 4),
+                        "subject": metadata['subject'],
+                        "sender": metadata['sender'],
+                        "content_length": metadata['content_length'],
+                        "content_preview": document[:200] + "..." if len(document) > 200 else document
+                    })
+            
+            return {
+                "success": True,
+                "input_email": {
+                    "filename": input_email.filename,
+                    "subject": input_email.subject,
+                    "sender": input_email.sender,
+                    "content_length": len(input_email.content),
+                    "content_preview": input_email.content[:200] + "..." if len(input_email.content) > 200 else input_email.content
+                },
+                "similar_emails": similar_emails,
+                "total_found": total_found,
+                "returned": len(similar_emails),
+                "min_similarity_threshold": min_similarity
+            }
+            
+        except Exception as e:
+            logger.error(f"Error querying ChromaDB: {e}")
+            return {
+                "success": False,
+                "error": f"ChromaDB query failed: {str(e)}",
+                "input_email": {
+                    "filename": input_email.filename,
+                    "subject": input_email.subject,
+                    "sender": input_email.sender,
+                    "content_length": len(input_email.content)
+                },
+                "similar_emails": []
+            }
 
 # Global tool instance
 _email_similarity_tool = None

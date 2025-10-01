@@ -2,6 +2,7 @@
 """
 Simple interface to run the agentic email analysis with text prompts
 """
+# TODO: actual RAG database, chroma DB, processing should appear
 
 import os
 import sys

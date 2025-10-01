@@ -1,18 +1,7 @@
-# Environment variables and secrets
+# Environment variables
 .env
-.env.local
-.env.*.local
-*.key
-*.secret
-*.pem
-*.p12
 
-# API Keys and credentials
-config.json
-credentials.json
-secrets.json
-
-# Python cache and compiled files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -33,23 +22,19 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-MANIFEST
 
-# Virtual environments
+# Virtual Environment
 venv/
 env/
 ENV/
-env.bak/
-venv.bak/
 
-# IDE files
-.vscode/
+# IDE
 .idea/
+.vscode/
 *.swp
 *.swo
-*~
 
-# OS files
+# OS
 .DS_Store
 .DS_Store?
 ._*
@@ -57,19 +42,3 @@ venv.bak/
 .Trashes
 ehthumbs.db
 Thumbs.db
-
-# Logs
-*.log
-logs/
-
-# Temporary files
-*.tmp
-*.temp
-.cache/
-
-# Email data (optional - uncomment if you don't want to include email files)
-# email/
-# email_test/
-
-# Embeddings cache (optional - uncomment if you don't want to include cache)
-# embeddings_cache.json
